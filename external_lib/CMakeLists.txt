@@ -1,0 +1,8 @@
+add_subdirectory(kinematics)
+add_subdirectory(pico_uart_transports)
+add_subdirectory(motors)
+add_subdirectory(rpm)
+add_subdirectory(imu)
+add_subdirectory(odometry)
+add_subdirectory(rate_lim)
+add_subdirectory(pid)
