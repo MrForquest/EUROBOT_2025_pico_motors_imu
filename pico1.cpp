@@ -15,14 +15,12 @@
 #include "odometry.h"
 #include "rpm.h"
 #include "pid.h"
-#include "imu.h"
 //#include "rate_lim.h"
 
 #include <nav_msgs/msg/odometry.h>
 #include <geometry_msgs/msg/quaternion.h>
 #include <geometry_msgs/msg/twist.h>
 #include <geometry_msgs/msg/vector3.h>
-#include <sensor_msgs/msg/imu.h>
 
 #ifndef RCCHECK
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){rclErrorLoop();}}
@@ -48,8 +46,6 @@ const uint LED_PIN = 25;
 int cnt = 1;
 bool flag = true;
 
-rcl_publisher_t imu_publisher;
-sensor_msgs__msg__Imu imu_msg;
 
 rcl_publisher_t odom_publisher;
 nav_msgs__msg__Odometry odom_msg;
@@ -65,8 +61,6 @@ geometry_msgs__msg__Vector3 odom_init_msg;
 
 //rcl_subscription_t servo_subscriber;
 //geometry_msgs__msg__Vector3 servo_msg;
-
-MPU9250IMU imu;
 
 //IMU::data imu_dat;
 
@@ -238,11 +232,6 @@ void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
     rcl_ret_t ret1 = rcl_publish(&rpm_publisher, &rpm_msg, NULL);
     rcl_ret_t ret = rcl_publish(&odom_publisher, &odom_msg, NULL);
     
-    
-   imu_msg = imu.getData();
-   imu_msg.header.stamp.sec = time_stamp.tv_sec;
-   imu_msg.header.stamp.nanosec = time_stamp.tv_nsec;
-
 
     // imu_msg.orientation.w = imu_dat.w;
     // imu_msg.orientation.x = imu_dat.x;
@@ -253,7 +242,6 @@ void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
     // imu_msg.linear_acceleration.x = imu_dat.lin_accel_x;
     // imu_msg.linear_acceleration.y = imu_dat.lin_accel_y;
 
-    rcl_ret_t ret2 = rcl_publish(&imu_publisher, &imu_msg, NULL);
 }
 
 void twist_subscriber_callback(const void *msgin) {
@@ -297,15 +285,6 @@ int main() {
 
     motors_init();
 
-    bool imu_ok = imu.init();
-    if(!imu_ok)
-    {
-        while(1)
-        {
-            blink();
-            sleep_ms(100);
-        }
-    }
     impulse_counter_init();
     
 
@@ -345,12 +324,6 @@ int main() {
     //     &node,
     //     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Vector3),
     //     "odom/init");
-
-    rclc_publisher_init_default(
-        &imu_publisher,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
-        "imu/data");
 
     rclc_publisher_init_default(
         &rpm_publisher,

@@ -42,7 +42,6 @@ target_link_libraries(pico1
     pico_uart_transports
     motors
     rpm
-    imu
     odometry
     pid
     rate_lim
