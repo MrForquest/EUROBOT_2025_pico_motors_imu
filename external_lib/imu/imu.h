@@ -28,8 +28,8 @@
 // https://forum.arduino.cc/t/good-news-dmp-from-mpu6050-can-be-used-without-interrupt-pin/393797
 
 #define I2C_PORT i2c0
-#define SDA 20
-#define SCL 21
+#define SDA 12
+#define SCL 13
 #define INT 8
 
 // Для снижения нагрузки на процессор в файле MPU6050_6Axis_Motion увеличиваем значение делителя #define MPU6050_DMP_FIFO_RATE_DIVISOR 0x05

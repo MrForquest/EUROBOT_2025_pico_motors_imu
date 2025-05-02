@@ -31,7 +31,7 @@ class Odometry
 {
     public:
         Odometry();
-        void init(float x_pos_0, float y_pos_0, float heading_0);
+        void init(float x_pos_0, float y_pos_0);
         void update(float vel_dt, float linear_vel_x, float linear_vel_y, float angular_vel_z);
         nav_msgs__msg__Odometry getData();
 

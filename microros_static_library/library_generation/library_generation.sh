@@ -41,7 +41,7 @@ find /project/src/ ! -name micro_ros_arduino.h ! -name *.c ! -name *.cpp ! -name
 rm -rf firmware/build
 
 export PICO_SDK_PATH=/pico-sdk
-ros2 run micro_ros_setup build_firmware.sh /project/microros_static_library/library_generation/toolchain.cmake /project/microros_static_library/library_generation/
+ros2 run micro_ros_setup build_firmware.sh /project/microros_static_library/library_generation/toolchain.cmake /project/microros_static_library/library_generation/colcon.meta
 
 find firmware/build/include/ -name "*.c"  -delete
 mkdir -p /project/libmicroros/include

@@ -24,16 +24,16 @@ Odometry::Odometry():
     odom_msg_.child_frame_id = micro_ros_string_utilities_set(odom_msg_.child_frame_id, "base_footprint");
 }
 
-void Odometry::init(float x_pos_0, float y_pos_0, float heading_0){
+void Odometry::init(float x_pos_0, float y_pos_0){
     x_pos_ = x_pos_0;
     y_pos_ = y_pos_0;
-    heading_ = heading_0;
 }
 
 void Odometry::update(float vel_dt, float linear_vel_x, float linear_vel_y, float angular_vel_z)
 {
     float delta_heading = angular_vel_z * vel_dt; //radians
     float cos_h = cos(heading_);
+    
     float sin_h = sin(heading_);
     float delta_x = (linear_vel_x * cos_h - linear_vel_y * sin_h) * vel_dt; //m
     float delta_y = (linear_vel_x * sin_h + linear_vel_y * cos_h) * vel_dt; //m

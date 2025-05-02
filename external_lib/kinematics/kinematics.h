@@ -4,7 +4,7 @@
 
 #define LINO_BASE DIFFERENTIAL_DRIVE        // Mecanum drive robot
 
-#define MOTOR_MAX_RPM 140                   // motor's max RPM          
+#define MOTOR_MAX_RPM 107                   // motor's max RPM          
 #define MAX_RPM_RATIO 0.85                  // max RPM allowed for each MAX_RPM_ALLOWED = MOTOR_MAX_RPM * MAX_RPM_RATIO          
 
 //Для бесщеточного мотора с встроенным контроллером

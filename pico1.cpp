@@ -1,3 +1,37 @@
+/*-------------------------------------------------------------------------------------------------------------------
+--
+-- Проект      : EUROBOT_2025_pico_motors
+-- Модуль      : pico1
+-- Автор       : Караваев К.А.
+-- Компания    : МИФИ
+-- Файлы       : 
+--
+---------------------------------------------------------------------------------------------------------------------
+--
+-- Описание    : Программа для управления и контроля движения на базе raspberry pi pico 2 (rp2350)
+--
+---------------------------------------------------------------------------------------------------------------------
+--
+-- V0.0 (23.04.2025)  - Копирован и видоизменен старый проект. (eurobot_2024_embedded). Содержит код для двигателей 
+                        JGB37-3650 (блок "kinematics" для преобразования оборотов в минуту в скорости вращения и др., 
+                        блок "motors" для аппаратного управления моторами(выдача шим-импульсов для контроля скорости, 
+                        направление вращения), блок "rpm" для подсчета номинальных оборотов в минуту(дополняет блок "motors"),
+                        "rate_lim" и "pid" (не используются), блок "odometry" для расчета движения (путь и др.) и 
+                        блок "imu" для вычисления скоростей и угла поворота, подключенный через i2c.
+-- V0.1 (28.04.2025)  - произведен рефакторинг кода, добавлен reboot, если микро-рос клиент перестает отвечать на запросы
+                        агента (например, после воздействия статического электричества), добавлены топики для передачи
+                        позиции робота в блок "odometry" (odom/reboot) при старте и 2 варианта функции 
+                        void odom_init_subscriber_callback(const void *msgin) обработки посылки с начальными координатами
+                        робота при старте (необходимо для корректного накопления значений пути в одометрии) (функции не 
+                        тестировались). Закомментирован блок "imu".
+-- V1.0 (02.05.2025)  - стабильная версия. Функции передачи начального положения робота при старте и соответствующий
+                        топик закомментированы за ненадобностью (для рассчета маршрута движения на pi4 из блока одометрии
+                        используются только скорости, а не путь)
+--
+---------------------------------------------------------------------------------------------------------------------
+*/
+
+
 #include <rcl/error_handling.h>
 #include <rcl/rcl.h>
 #include <rclc/executor.h>
@@ -14,19 +48,38 @@
 #include "pico_uart_transports.h"  //только так (расширене не .h ,а .c) работает передача данных по юарт.
 #include "odometry.h"
 #include "rpm.h"
-#include "pid.h"
-#include "imu.h"
+//#include "pid.h"
+//#include "imu.h"
 //#include "rate_lim.h"
 
 #include <nav_msgs/msg/odometry.h>
 #include <geometry_msgs/msg/quaternion.h>
 #include <geometry_msgs/msg/twist.h>
-#include <geometry_msgs/msg/vector3.h>
-#include <sensor_msgs/msg/imu.h>
+//#include <geometry_msgs/msg/vector3.h>
+//#include <sensor_msgs/msg/imu.h>
+
+
+#define PUBLISH_DELAY_MS 10
+#define LED_PIN 25
+
+//#define USE_IMU
 
 #ifndef RCCHECK
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){rclErrorLoop();}}
 #endif
+#define EXECUTE_EVERY_N_MS(MS, X)  do { \
+  static volatile int64_t init = -1; \
+  if (init == -1) { init = uxr_millis();} \
+  if (uxr_millis() - init > MS) { X; init = uxr_millis();} \
+} while (0)
+
+
+rcl_timer_t timer;
+rcl_node_t node;
+rcl_allocator_t allocator;
+rclc_support_t support;
+rclc_executor_t executor;
+
 
 unsigned long long time_offset = 0;
 unsigned long prev_cmd_time = 0;
@@ -38,18 +91,22 @@ bool sync_time_flag = false;
 Odometry odometry;
 rpm current_rpm;
 //imp_num current_imp_num;
-struct repeating_timer timer;
+//struct repeating_timer timer;
 
 
 float vel_y;
 float angular_vel;
 
-const uint LED_PIN = 25;
+//const uint LED_PIN = 25;
 int cnt = 1;
 bool flag = true;
 
+#ifdef USE_IMU
+MPU9250IMU imu;
+
 rcl_publisher_t imu_publisher;
 sensor_msgs__msg__Imu imu_msg;
+#endif
 
 rcl_publisher_t odom_publisher;
 nav_msgs__msg__Odometry odom_msg;
@@ -60,18 +117,12 @@ geometry_msgs__msg__Quaternion rpm_msg;
 rcl_subscription_t twist_subscriber;
 geometry_msgs__msg__Twist twist_msg;
 
-rcl_subscription_t odom_init_subscriber;
-geometry_msgs__msg__Vector3 odom_init_msg;
+// rcl_subscription_t odom_init_subscriber;
+// nav_msgs__msg__Odometry odom_init_msg;
 
-//rcl_subscription_t servo_subscriber;
-//geometry_msgs__msg__Vector3 servo_msg;
 
-MPU9250IMU imu;
-
-//IMU::data imu_dat;
-
-PID motor1_pid(RPM_MIN, RPM_MAX, K_P, K_I, K_D);
-PID motor2_pid(RPM_MIN, RPM_MAX, K_P, K_I, K_D);
+//PID motor1_pid(RPM_MIN, RPM_MAX, K_P, K_I, K_D);
+//PID motor2_pid(RPM_MIN, RPM_MAX, K_P, K_I, K_D);
 
 //Rate_Limiter rate_lim(RISE_LIM, FALL_LIM);
 
@@ -92,6 +143,13 @@ Kinematics kinematics(
 Kinematics::velocities cmd_vel;
 //Kinematics::velocities current_vel;    //Скорости, полученные из одометрии 
 
+enum states 
+{
+  WAITING_AGENT,
+  AGENT_AVAILABLE,
+  AGENT_CONNECTED,
+  AGENT_DISCONNECTED
+} state;
 
 void blink() {
     gpio_put(LED_PIN, flag);
@@ -120,6 +178,62 @@ float get_dt_s(unsigned long *prev_time){
     float dt = (now - *prev_time) / 1000.0;
     *prev_time = now;
     return dt;
+}
+
+struct timespec getTime()
+{
+    struct timespec tp = {0};
+    // add time difference between uC time and ROS time to
+    // synchronize time with ROS
+    unsigned long long now = to_ms_since_boot(get_absolute_time()) + time_offset;
+    tp.tv_sec = now / 1000;
+    tp.tv_nsec = (now % 1000) * 1000000;
+
+    return tp;
+}
+
+void publishData(){
+    rcl_ret_t ret;
+//Дополнительный топик для отслеживания оборотов моторов.
+    rpm_msg.w = current_rpm.rpm1;
+    rpm_msg.x = current_rpm.rpm2;
+    // rpm_msg.y = current_rpm.rpm3;
+    // rpm_msg.z = current_rpm.rpm4;
+    rpm_msg.y = 0;
+    rpm_msg.z = 0;
+//
+
+
+
+    odom_msg = odometry.getData();
+
+    //синхронищзируем время
+    struct timespec time_stamp = getTime();
+
+    odom_msg.header.stamp.sec = time_stamp.tv_sec;
+    odom_msg.header.stamp.nanosec = time_stamp.tv_nsec;
+    //
+
+    ret = rcl_publish(&rpm_publisher, &rpm_msg, NULL);
+    ret = rcl_publish(&odom_publisher, &odom_msg, NULL);
+    
+#ifdef USE_IMU
+   imu_msg = imu.getData();
+   imu_msg.header.stamp.sec = time_stamp.tv_sec;
+   imu_msg.header.stamp.nanosec = time_stamp.tv_nsec;
+
+
+    // imu_msg.orientation.w = imu_dat.w;
+    // imu_msg.orientation.x = imu_dat.x;
+    // imu_msg.orientation.y = imu_dat.y;
+    // imu_msg.orientation.z = imu_dat.z;
+
+    // imu_msg.angular_velocity.z = imu_dat.ang_z;  //Отправляется не угловая скорость, а угол!!!!!!
+    // imu_msg.linear_acceleration.x = imu_dat.lin_accel_x;
+    // imu_msg.linear_acceleration.y = imu_dat.lin_accel_y;
+
+    ret = rcl_publish(&imu_publisher, &imu_msg, NULL);
+#endif
 }
 
 void moveBase(){
@@ -186,8 +300,29 @@ void moveBase(){
         current_vel.angular_z
     );
 //*    calculate_current_rpm(vel_dt);
-
 }
+
+
+// void odom_init_subscriber_callback(const void *msgin){
+//     const nav_msgs__msg__Odometry *msg = (const nav_msgs__msg__Odometry *)msgin;
+
+//     odometry.init(msg->pose.pose.position.x, msg->pose.pose.position.y);
+    
+// //Отписываемся от топика, в итоге в следующий раз в это прерывание не входим
+//     rcl_subscription_fini(&odom_init_subscriber, &node);
+// }
+
+//
+// void odom_init_subscriber_callback(const void *msgin){
+//     static bool message_received = false;
+//     if(message_received = false){
+//     const nav_msgs__msg__Odometry *msg = (const nav_msgs__msg__Odometry *)msgin;
+//     odometry.init(msg->pose.pose.position.x, msg->pose.pose.position.y);
+//     message_received == true;
+//     }
+// }
+
+
 
 void syncTime()
 {
@@ -199,62 +334,20 @@ void syncTime()
     time_offset = ros_time_ms - now;
 }
 
-struct timespec getTime()
-{
-    struct timespec tp = {0};
-    // add time difference between uC time and ROS time to
-    // synchronize time with ROS
-    unsigned long long now = to_ms_since_boot(get_absolute_time()) + time_offset;
-    tp.tv_sec = now / 1000;
-    tp.tv_nsec = (now % 1000) * 1000000;
 
-    return tp;
-}
+
+
+
 
 void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
     moveBase();
+    publishData();
 
-
-
-//Дополнительный топик для отслеживания оборотов моторов.
-    rpm_msg.w = current_rpm.rpm1;
-    rpm_msg.x = current_rpm.rpm2;
-    // rpm_msg.y = current_rpm.rpm3;
-    // rpm_msg.z = current_rpm.rpm4;
-    rpm_msg.y = 0;
-    rpm_msg.z = 0;
-//
-
-
-    odom_msg = odometry.getData();
-
-    //синхронищзируем время
-    struct timespec time_stamp = getTime();
-
-    odom_msg.header.stamp.sec = time_stamp.tv_sec;
-    odom_msg.header.stamp.nanosec = time_stamp.tv_nsec;
-    //
-
-    rcl_ret_t ret1 = rcl_publish(&rpm_publisher, &rpm_msg, NULL);
-    rcl_ret_t ret = rcl_publish(&odom_publisher, &odom_msg, NULL);
-    
-    
-   imu_msg = imu.getData();
-   imu_msg.header.stamp.sec = time_stamp.tv_sec;
-   imu_msg.header.stamp.nanosec = time_stamp.tv_nsec;
-
-
-    // imu_msg.orientation.w = imu_dat.w;
-    // imu_msg.orientation.x = imu_dat.x;
-    // imu_msg.orientation.y = imu_dat.y;
-    // imu_msg.orientation.z = imu_dat.z;
-
-    // imu_msg.angular_velocity.z = imu_dat.ang_z;  //Отправляется не угловая скорость, а угол!!!!!!
-    // imu_msg.linear_acceleration.x = imu_dat.lin_accel_x;
-    // imu_msg.linear_acceleration.y = imu_dat.lin_accel_y;
-
-    rcl_ret_t ret2 = rcl_publish(&imu_publisher, &imu_msg, NULL);
 }
+
+
+
+
 
 void twist_subscriber_callback(const void *msgin) {
     const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msgin;
@@ -264,24 +357,99 @@ void twist_subscriber_callback(const void *msgin) {
 
 }
 
-// void odom_init_subscriber_callback(const void *msgin) {
-//     const geometry_msgs__msg__Vector3 *msg = (const geometry_msgs__msg__Vector3 *)msgin;
-//     static float x_pos_0, y_pos_0, heading_0; 
-//     //Проверяем лишь позиции по x и y с коридором 1 см, по углу не проверяем (вряд ли два раза удастся начать ровно с той же точки, так что проверка по углу излишня)
-//     if( (msg->x - x_pos_0 > 0.001) || (msg->x - x_pos_0 < -0.001) || (msg->y - y_pos_0 > 0.001) || (msg->y - y_pos_0 < -0.001) ){
-//         x_pos_0 = msg->x;
-//         y_pos_0 = msg->y;
-//         heading_0 = msg->z;
-//         odometry.init(x_pos_0, y_pos_0, heading_0);
-//     }
-// }
 
-// void servo_subscriber_callback(const void * msgin)
-// {
-//      const geometry_msgs__msg__Vector3 * msg = (const geometry_msgs__msg__Vector3 *)msgin;
-//      servo(msg->x, msg->y);
-//      blink();
-// }
+
+bool createEntities(){
+    allocator = rcl_get_default_allocator();
+
+    // // Wait for agent successful ping for 2 minutes.
+    // const int timeout_ms = 1000;
+    // const uint8_t attempts = 120;
+
+    // rcl_ret_t ret = rmw_uros_ping_agent(timeout_ms, attempts);
+
+    // if (ret != RCL_RET_OK) {
+    //     // Unreachable agent, exiting program.
+    //     return ret;
+    // }
+
+    RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+
+    RCCHECK(rclc_node_init_default(&node, "pico_node", "", &support));
+
+    RCCHECK(rclc_subscription_init_default(
+        &twist_subscriber,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+        "cmd_vel"));
+
+    // RCCHECK(rclc_subscription_init_default(
+    //     &odom_init_subscriber,
+    //     &node,
+    //     ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+    //     "odom/reboot"));    
+
+#ifdef USE_IMU
+    RCCHECK(rclc_publisher_init_default(
+        &imu_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
+        "imu/data"));
+#endif
+
+    RCCHECK(rclc_publisher_init_default(
+        &rpm_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Quaternion),
+        "rpm_topic"));
+
+    RCCHECK(rclc_publisher_init_default(
+        &odom_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+        "odom/unfiltered"));    
+
+    RCCHECK(rclc_timer_init_default(
+        &timer,
+        &support,
+        RCL_MS_TO_NS(PUBLISH_DELAY_MS),
+        timer_callback));
+
+
+    RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
+    RCCHECK(rclc_executor_add_timer(&executor, &timer));
+   
+
+    RCCHECK(rclc_executor_add_subscription(&executor, &twist_subscriber, &twist_msg, &twist_subscriber_callback, ON_NEW_DATA));
+    // RCCHECK(rclc_executor_add_subscription(&executor, &odom_init_subscriber, &odom_init_msg, &odom_init_subscriber_callback, ON_NEW_DATA));
+
+
+    syncTime();
+
+    return true;
+}
+
+bool destroyEntities(){
+    rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+    (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+    rcl_ret_t ret;
+//Приравниваем ret только для того, чтобы компилятор не ругался.
+    ret = rcl_timer_fini(&timer);
+    ret = rcl_node_fini(&node);
+    rclc_support_fini(&support);
+    rclc_executor_fini(&executor);
+
+    ret = rcl_subscription_fini(&twist_subscriber,&node);
+
+#ifdef USE_IMU
+    ret = rcl_publisher_fini(&imu_publisher,&node);
+#endif
+    ret = rcl_publisher_fini(&rpm_publisher,&node);
+    ret = rcl_publisher_fini(&odom_publisher,&node);
+    
+    return true;
+}
+
 
 int main() {
     gpio_init(LED_PIN);
@@ -297,6 +465,7 @@ int main() {
 
     motors_init();
 
+#ifdef USE_IMU
     bool imu_ok = imu.init();
     if(!imu_ok)
     {
@@ -306,82 +475,36 @@ int main() {
             sleep_ms(100);
         }
     }
+#endif
     impulse_counter_init();
     
-
-
-
-    rcl_timer_t timer;
-    rcl_node_t node;
-    rcl_allocator_t allocator;
-    rclc_support_t support;
-    rclc_executor_t executor;
-
-    allocator = rcl_get_default_allocator();
-
-    // Wait for agent successful ping for 2 minutes.
-    const int timeout_ms = 1000;
-    const uint8_t attempts = 120;
-
-    rcl_ret_t ret = rmw_uros_ping_agent(timeout_ms, attempts);
-
-    if (ret != RCL_RET_OK) {
-        // Unreachable agent, exiting program.
-        return ret;
-    }
-
-    rclc_support_init(&support, 0, NULL, &allocator);
-
-    rclc_node_init_default(&node, "pico_node", "", &support);
-
-    rclc_subscription_init_default(
-        &twist_subscriber,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
-        "cmd_vel");
-
-    // rclc_subscription_init_default(
-    //     &odom_init_subscriber,
-    //     &node,
-    //     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Vector3),
-    //     "odom/init");
-
-    rclc_publisher_init_default(
-        &imu_publisher,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
-        "imu/data");
-
-    rclc_publisher_init_default(
-        &rpm_publisher,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Quaternion),
-        "rpm_topic");
-
-    rclc_publisher_init_default(
-        &odom_publisher,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
-        "odom/unfiltered");    
-
-    rclc_timer_init_default(
-        &timer,
-        &support,
-        RCL_MS_TO_NS(CNT_DELAY_MS),
-        timer_callback);
-
-
-    rclc_executor_init(&executor, &support.context, 2, &allocator);
-    rclc_executor_add_timer(&executor, &timer);
-   
-
-    rclc_executor_add_subscription(&executor, &twist_subscriber, &twist_msg, &twist_subscriber_callback, ON_NEW_DATA);
-//    rclc_executor_add_subscription(&executor, &odom_init_subscriber, &odom_init_msg, &odom_init_subscriber_callback, ON_NEW_DATA);
-   
-    syncTime();
-
     while (true) {
-        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
+        switch (state) 
+    {
+        case WAITING_AGENT:
+            EXECUTE_EVERY_N_MS(500, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_AVAILABLE : WAITING_AGENT;);
+            break;
+        case AGENT_AVAILABLE:
+            state = (true == createEntities()) ? AGENT_CONNECTED : WAITING_AGENT;
+            if (state == WAITING_AGENT) 
+            {
+                destroyEntities();
+            }
+            break;
+        case AGENT_CONNECTED:
+            EXECUTE_EVERY_N_MS(200, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_CONNECTED : AGENT_DISCONNECTED;);
+            if (state == AGENT_CONNECTED) 
+            {
+                rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
+            }
+            break;
+        case AGENT_DISCONNECTED:
+            destroyEntities();
+            state = WAITING_AGENT;
+            break;
+        default:
+            break;
+    }
     }
     return 0;
 }
